@@ -100,11 +100,12 @@
             <a class="btn btn-primary me-2" href="#conceptos">Aprender conceptos</a>
             <button class="btn btn-outline-primary me-2" id="openExampleVideo"><i class="bi bi-play-btn me-1"></i> Ver ejemplo práctico (video)</button>
             <a class="btn btn-accent" href="#ejercicios" style="background:var(--accent); color:#fff"><i class="bi bi-clipboard-check me-1"></i> Resolver ejercicios</a>
-            <a href="{{ url_for('static', filename='Tablas_fluidos.pdf') }}" 
+            <a href="Tablas_fluidos.pdf" 
    download 
    class="btn btn-danger me-2">
   <i class="bi bi-file-earmark-pdf"></i> Descargar Tablas de Fluidos
 </a>
+
 
           </div>
         </div>
@@ -521,156 +522,289 @@
 <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11.7.27/dist/sweetalert2.all.min.js"></script>
 
 <script>
-  // Theme toggle
-  const themeBtn = document.getElementById('toggleTheme');
-  themeBtn.addEventListener('click', () => { document.body.classList.toggle('dark'); });
+/* ============================
+   CONSTANTES Y FUNCIONES FÍSICAS
+   (traducción completa de app.py)
+   ============================ */
+const RHO_WATER = 998.0;     // kg/m3
+const MU_WATER  = 0.001002;  // Pa·s
+const G = 9.81;
 
-  // Open example video
-  document.getElementById('openExampleVideo')?.addEventListener('click', () => {
-    const modal = new bootstrap.Modal(document.getElementById('videoModal'));
-    modal.show();
-  });
+function area(D) {
+  return Math.PI * D * D / 4;
+}
 
-  // ---- Ejemplo práctico: llama al endpoint /api/parallel con los valores por defecto ----
-  document.getElementById('runExampleCalc')?.addEventListener('click', async () => {
-    const payload = { QT: 0.01, D1: 0.04, L1: 6, D2: 0.03, L2: 5 };
-    Swal.fire({title:'Calculando...', didOpen: ()=>Swal.showLoading()});
-    try {
-      const res = await fetch('/api/parallel', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify(payload)
-      });
-      const data = await res.json();
-      Swal.close();
-      if (data.error) {
-        Swal.fire({icon:'error', title:'Error', text: data.error});
-        return;
-      }
-      const container = document.getElementById('exampleResult');
-      container.style.display = 'block';
-      container.innerHTML = `<div class="alert alert-info">Resultado aproximado: <strong>Q1 = ${data.Q1.toFixed(6)} m³/s</strong>, <strong>Q2 = ${data.Q2.toFixed(6)} m³/s</strong> (hf ≈ ${data.hf.toFixed(6)} m) — iter: ${data.it}</div>`;
-    } catch (err) {
-      Swal.close();
-      Swal.fire({icon:'error', title:'Error', text: 'No se pudo conectar con el servidor.'});
+function velocityFromQ(Q, D) {
+  return Q / area(D);
+}
+
+function reynoldsNumber(Q, D, rho = RHO_WATER, mu = MU_WATER) {
+  const V = Math.abs(velocityFromQ(Q, D));
+  return Math.abs((rho * V * D) / mu);
+}
+
+function frictionFactorSwameeJain(Re, D, eps = 0.000045) {
+  if (Re <= 0) return 1e6;
+  if (Re < 2000) return 64.0 / Re;
+  let term = (eps / (3.7 * D)) + (5.74 / Math.pow(Re, 0.9));
+  if (term <= 0) term = 1e-12;
+  return 0.25 / Math.pow(Math.log10(term), 2);
+}
+
+function headLoss(Q, D, L) {
+  if (Q <= 0) return 0;
+  const V = velocityFromQ(Q, D);
+  const Re = reynoldsNumber(Q, D);
+  const f = frictionFactorSwameeJain(Re, D);
+  return f * (L / D) * (V * V / (2 * G));
+}
+
+/* ============================
+   SOLVER PARA DOS TUBERÍAS EN PARALELO
+   (mismo algoritmo: bisección + comprobaciones)
+   ============================ */
+function solveParallel(QT, D1, L1, D2, L2, tol = 1e-9, maxIter = 100) {
+  if (QT <= 0 || D1 <= 0 || D2 <= 0 || L1 <= 0 || L2 <= 0) {
+    return { Q1: 0, Q2: 0, hf: 0, it: 0 };
+  }
+
+  let a = 1e-12;
+  let b = QT - 1e-12;
+  if (b <= a) {
+    return { Q1: QT, Q2: 0, hf: headLoss(QT, D1, L1), it: 0 };
+  }
+
+  const F = (Q1) => {
+    const Q2 = QT - Q1;
+    return headLoss(Q1, D1, L1) - headLoss(Q2, D2, L2);
+  };
+
+  let fa = F(a);
+  let fb = F(b);
+
+  // intentar asegurar cambio de signo; si no, reducir b
+  if (fa * fb > 0) {
+    for (let i = 0; i < 20; i++) {
+      b = Math.max(a + 1e-15, b * 0.9);
+      fb = F(b);
+      if (fa * fb <= 0) break;
     }
-  });
-
-  // ---- Calculadora Reynolds (usa /api/reynolds) ----
-  async function calcularReynolds() {
-    const nuVal = document.getElementById("temperatura").value;
-    const D = parseFloat(document.getElementById("diametro").value);
-    const Q = parseFloat(document.getElementById("caudal").value);
-
-    if (!nuVal || !D || !Q) {
-      Swal.fire({icon:'warning', title:'Datos incompletos', text:'Por favor ingresa todos los valores.'});
-      return;
-    }
-
-    const nu = parseFloat(nuVal); // aquí asumes que el select te da la viscosidad cinemática (m2/s)
-
-    Swal.fire({title:'Calculando...', allowOutsideClick:false, didOpen: ()=>Swal.showLoading()});
-    try {
-      const res = await fetch('/api/reynolds', {
-        method: 'POST',
-        headers: {'Content-Type':'application/json'},
-        body: JSON.stringify({ nu: nu, D: D, Q: Q })
-      });
-      const data = await res.json();
-      Swal.close();
-      if (data.error) {
-        Swal.fire({icon:'error', title:'Error', text: data.error});
-        return;
-      }
-      const V = data.V;
-      const Re = data.Re;
-      const tipo = data.flow_type === 'laminar' ? 'Flujo laminar 🟢' : (data.flow_type === 'transicional' ? 'Flujo transicional (mixto) 🟡' : 'Flujo turbulento 🔴');
-      const out = document.getElementById('calcResult1');
-      out.style.display = 'block';
-      out.innerHTML = `<div class="p-3 bg-light rounded border"><strong>Velocidad (V):</strong> ${V.toFixed(3)} m/s<br><strong>Reynolds:</strong> ${Re.toExponential(2)}<br><strong>${tipo}</strong></div>`;
-    } catch (err) {
-      Swal.close();
-      Swal.fire({icon:'error', title:'Error', text:'No se pudo conectar con el servidor.'});
+    if (fa * fb > 0) {
+      const Q1 = QT / 2;
+      return { Q1, Q2: QT - Q1, hf: headLoss(Q1, D1, L1), it: 0 };
     }
   }
 
-  // ---- Calculadora de caudales (2 tuberías) ----
-  document.getElementById('calcButton')?.addEventListener('click', async () => {
-    const QT = parseFloat(document.getElementById('QT').value) || 0;
-    const D1 = parseFloat(document.getElementById('D1').value) || 0;
-    const L1 = parseFloat(document.getElementById('L1').value) || 0;
-    const D2 = parseFloat(document.getElementById('D2').value) || 0;
-    const L2 = parseFloat(document.getElementById('L2').value) || 0;
-
-    if (QT <= 0 || D1 <= 0 || D2 <= 0 || L1 <= 0 || L2 <= 0){
-      Swal.fire({icon:'warning', title:'Datos incompletos', text:'Por favor ingresa valores mayores que cero.'});
-      return;
+  let it = 0;
+  while (it < maxIter) {
+    const mid = (a + b) / 2;
+    const fm = F(mid);
+    if (Math.abs(fm) < tol) break;
+    if (fa * fm <= 0) {
+      b = mid;
+      fb = fm;
+    } else {
+      a = mid;
+      fa = fm;
     }
-    Swal.fire({title:'Calculando...', didOpen: ()=>{Swal.showLoading();}});
-    try {
-      const res = await fetch('/api/parallel', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ QT, D1, L1, D2, L2 })
-      });
-      const data = await res.json();
-      Swal.close();
-      if (data.error) { Swal.fire({icon:'error', title:'Error', text:data.error}); return; }
-      const out = document.getElementById('calcResult');
-      out.style.display='block';
-      out.innerHTML = `<div class="p-3 bg-light rounded">
-        <strong>Q1:</strong> ${data.Q1.toFixed(6)} m³/s<br>
-        <strong>Q2:</strong> ${data.Q2.toFixed(6)} m³/s<br>
-        <strong>Pérdida de carga (hf):</strong> ${data.hf.toFixed(5)} m
-      </div>`;
-    } catch (err) {
-      Swal.close();
-      Swal.fire({icon:'error', title:'Error', text:'No se pudo conectar con el servidor.'});
-    }
-  });
+    it++;
+  }
 
-  // ---- Resto de scripts: quiz, highlight, reset, etc. (puedes copiar los tuyos tal cual) ----
+  const Q1 = (a + b) / 2;
+  const Q2 = QT - Q1;
+  const hf = headLoss(Q1, D1, L1);
+  return { Q1, Q2, hf, it };
+}
 
-  // QUIZ (igual que tu original)
-  document.getElementById('submitQuiz')?.addEventListener('click', () => {
-    const a1 = document.querySelector('input[name=q1]:checked');
-    const a2 = document.querySelector('input[name=q2]:checked');
-    const a3 = document.querySelector('input[name=q3]:checked');
-    if (!a1 || !a2 || !a3){ Swal.fire({icon:'warning', title:'Completa el quiz', text:'Responde todas las preguntas.'}); return; }
-    let score=0;
-    if (a1.value === 'b') score++;
-    if (a2.value === 'a') score++;
-    if (a3.value === 'a') score++;
-    const percent = Math.round((score/3)*100);
-    const icon = percent >= 66 ? 'success' : (percent >= 33 ? 'info' : 'error');
-    Swal.fire({icon:icon, title:`Resultado: ${percent}%`, html:`Obtuviste ${score} de 3 aciertos.`});
-  });
-
-  document.getElementById('resetQuiz')?.addEventListener('click', () => {
-    document.querySelectorAll('#quiz input[type=radio]').forEach(i=>i.checked=false);
-  });
-
-  document.querySelectorAll('.navbar a.nav-link').forEach(link=>{
-    link.addEventListener('click',(e)=>{
-      const href = link.getAttribute('href');
-      if (!href || !href.startsWith('#')) return;
-      setTimeout(()=>{
-        const el = document.querySelector(href);
-        if (el){ el.classList.add('glow'); setTimeout(()=>el.classList.remove('glow'),900); }
-      },400);
-    });
-  });
-
-// ===============================
-// AGREGAR / ELIMINAR RAMALES
-// ===============================
 /* ============================
-   GENERADOR DE RAMALES
-============================ */
+   CALCULO MULTIRAMALES (equivalente a /calcularSistema)
+   Nota: replicamos exactamente la lógica del app.py
+   (en el app.py se dividía diametro y caudal por 1000)
+   por compatibilidad con el comportamiento anterior.
+   ============================ */
+function calc_f(Re, e, D) {
+  // Swamee–Jain (misma implementación que en Python)
+  if (Re < 2000) return 64 / Re;
+  return 0.25 / Math.pow(Math.log10(e / (3.7 * D) + 5.74 / Math.pow(Re, 0.9)), 2);
+}
+
+function calcularSistemaJS(ramales) {
+  // ramales: array con objetos {longitud, diametro, rugosidad, caudal, codos, globo, compuerta, entradas, salidas}
+  const rho = 1000;
+  const mu = 0.001;
+  const resultados = [];
+
+  for (const r of ramales) {
+    const L = r.longitud;
+    // Mantuvimos la conversión del app.py: diámetro y caudal se dividen por 1000
+    // (si tus entradas ya están en metros y m3/s, elimina estas divisiones)
+    const D = r.diametro / 1000;
+    const e = r.rugosidad;
+    const Q = r.caudal / 1000;
+
+    const A = Math.PI * Math.pow(D / 2, 2);
+    const V = (A === 0) ? 0 : Q / A;
+
+    const Re = (rho * V * D) / mu;
+    const f = calc_f(Re, e, D);
+
+    const hf_mayor = f * (L / D) * (Math.pow(V, 2) / (2 * 9.81));
+
+    const K_total = (0.9 * r.codos) + (10 * r.globo) + (0.2 * r.compuerta) + (0.5 * r.entradas) + (1.0 * r.salidas);
+
+    const hf_menor = K_total * (Math.pow(V, 2) / (2 * 9.81));
+
+    resultados.push({
+      velocidad: V,
+      reynolds: Re,
+      f: f,
+      h_mayor: hf_mayor,
+      h_menor: hf_menor,
+      h_total: hf_mayor + hf_menor
+    });
+  }
+
+  return resultados;
+}
+
+/* ============================
+   EVENTOS Y LÓGICA DEL FRONTEND
+   (se reemplazan todos los fetch por llamadas locales)
+   ============================ */
+
+// Theme toggle
+const themeBtn = document.getElementById('toggleTheme');
+if (themeBtn) {
+  themeBtn.addEventListener('click', () => { document.body.classList.toggle('dark'); });
+}
+
+// Open example video
+document.getElementById('openExampleVideo')?.addEventListener('click', () => {
+  const modal = new bootstrap.Modal(document.getElementById('videoModal'));
+  modal.show();
+});
+
+// ---- Ejemplo práctico: usa solveParallel local ----
+document.getElementById('runExampleCalc')?.addEventListener('click', () => {
+  const payload = { QT: 0.01, D1: 0.04, L1: 6, D2: 0.03, L2: 5 };
+  Swal.fire({title:'Calculando...', didOpen: ()=>Swal.showLoading()});
+  try {
+    // Llamada local
+    const data = solveParallel(payload.QT, payload.D1, payload.L1, payload.D2, payload.L2);
+    Swal.close();
+    const container = document.getElementById('exampleResult');
+    container.style.display = 'block';
+    container.innerHTML = `<div class="alert alert-info">Resultado aproximado: <strong>Q1 = ${data.Q1.toFixed(6)} m³/s</strong>, <strong>Q2 = ${data.Q2.toFixed(6)} m³/s</strong> (hf ≈ ${data.hf.toFixed(6)} m) — iter: ${data.it}</div>`;
+  } catch (err) {
+    Swal.close();
+    Swal.fire({icon:'error', title:'Error', text: 'Error en el cálculo local.'});
+  }
+});
+
+// ---- Calculadora Reynolds (local) ----
+function calcularReynolds() {
+  const nuVal = document.getElementById("temperatura")?.value;
+  const D = parseFloat(document.getElementById("diametro")?.value);
+  const Q = parseFloat(document.getElementById("caudal")?.value);
+
+  if (!nuVal || !D || !Q) {
+    Swal.fire({icon:'warning', title:'Datos incompletos', text:'Por favor ingresa todos los valores.'});
+    return;
+  }
+
+  const nu = parseFloat(nuVal); // viscosidad cinemática si el select la contiene
+
+  try {
+    // V = 4Q / (pi D^2)
+    const V = (4.0 * Q) / (Math.PI * Math.pow(D, 2));
+    const Re = (V * D) / nu;
+    const flow_type = Re < 2000 ? 'laminar' : (Re <= 4000 ? 'transicional' : 'turbulento');
+    const tipoText = flow_type === 'laminar' ? 'Flujo laminar 🟢' : (flow_type === 'transicional' ? 'Flujo transicional (mixto) 🟡' : 'Flujo turbulento 🔴');
+
+    const out = document.getElementById('calcResult1');
+    out.style.display = 'block';
+    out.innerHTML = `<div class="p-3 bg-light rounded border"><strong>Velocidad (V):</strong> ${V.toFixed(3)} m/s<br><strong>Reynolds:</strong> ${Re.toExponential(2)}<br><strong>${tipoText}</strong></div>`;
+  } catch (err) {
+    Swal.fire({icon:'error', title:'Error', text:'No se pudo calcular Reynolds.'});
+  }
+}
+
+// Si tu botón "Calcular Reynolds" vincula a esta función por onclick o similar, queda listo.
+// Ejemplo: <button onclick="calcularReynolds()">Calcular</button>
+
+// ---- Calculadora de caudales (2 tuberías) (local) ----
+document.getElementById('calcButton')?.addEventListener('click', () => {
+  const QT = parseFloat(document.getElementById('QT')?.value) || 0;
+  const D1 = parseFloat(document.getElementById('D1')?.value) || 0;
+  const L1 = parseFloat(document.getElementById('L1')?.value) || 0;
+  const D2 = parseFloat(document.getElementById('D2')?.value) || 0;
+  const L2 = parseFloat(document.getElementById('L2')?.value) || 0;
+
+  if (QT <= 0 || D1 <= 0 || D2 <= 0 || L1 <= 0 || L2 <= 0){
+    Swal.fire({icon:'warning', title:'Datos incompletos', text:'Por favor ingresa valores mayores que cero.'});
+    return;
+  }
+
+  Swal.fire({title:'Calculando...', didOpen: ()=>{Swal.showLoading();}});
+  try {
+    // usamos la función local
+    const data = solveParallel(QT, D1, L1, D2, L2);
+    Swal.close();
+    const out = document.getElementById('calcResult');
+    out.style.display='block';
+    out.innerHTML = `<div class="p-3 bg-light rounded">
+      <strong>Q1:</strong> ${data.Q1.toFixed(6)} m³/s<br>
+      <strong>Q2:</strong> ${data.Q2.toFixed(6)} m³/s<br>
+      <strong>Pérdida de carga (hf):</strong> ${data.hf.toFixed(5)} m
+    </div>`;
+  } catch (err) {
+    Swal.close();
+    Swal.fire({icon:'error', title:'Error', text:'No se pudo calcular localmente.'});
+  }
+});
+
+/* ============================
+   Resto de scripts (quiz, navegación, etc.)
+   ============================ */
+
+// QUIZ
+document.getElementById('submitQuiz')?.addEventListener('click', () => {
+  const a1 = document.querySelector('input[name=q1]:checked');
+  const a2 = document.querySelector('input[name=q2]:checked');
+  const a3 = document.querySelector('input[name=q3]:checked');
+  if (!a1 || !a2 || !a3){ Swal.fire({icon:'warning', title:'Completa el quiz', text:'Responde todas las preguntas.'}); return; }
+  let score=0;
+  if (a1.value === 'b') score++;
+  if (a2.value === 'a') score++;
+  if (a3.value === 'a') score++;
+  const percent = Math.round((score/3)*100);
+  const icon = percent >= 66 ? 'success' : (percent >= 33 ? 'info' : 'error');
+  Swal.fire({icon:icon, title:`Resultado: ${percent}%`, html:`Obtuviste ${score} de 3 aciertos.`});
+});
+
+document.getElementById('resetQuiz')?.addEventListener('click', () => {
+  document.querySelectorAll('#quiz input[type=radio]').forEach(i=>i.checked=false);
+});
+
+document.querySelectorAll('.navbar a.nav-link').forEach(link=>{
+  link.addEventListener('click',()=>{
+    const href = link.getAttribute('href');
+    if (!href || !href.startsWith('#')) return;
+    setTimeout(()=>{
+      const el = document.querySelector(href);
+      if (el){ el.classList.add('glow'); setTimeout(()=>el.classList.remove('glow'),900); }
+    },400);
+  });
+});
+
+/* ============================
+   AGREGAR / ELIMINAR RAMALES (UI)
+   ============================ */
 let contadorRamal = 1;
 
-document.getElementById("btnAgregarRamal").addEventListener("click", () => {
+document.getElementById("btnAgregarRamal")?.addEventListener("click", () => {
     const cont = document.getElementById("listaRamales");
+    if (!cont) return;
 
     const div = document.createElement("div");
     div.className = "card card-body mb-3 shadow-sm";
@@ -685,7 +819,7 @@ document.getElementById("btnAgregarRamal").addEventListener("click", () => {
             </div>
 
             <div class="col-md-3">
-                <label><strong>Diámetro (m)</strong></label>
+                <label><strong>Diámetro (mm)</strong></label>
                 <input type="number" class="form-control diametro" step="0.0001">
             </div>
 
@@ -695,7 +829,7 @@ document.getElementById("btnAgregarRamal").addEventListener("click", () => {
             </div>
 
             <div class="col-md-3">
-                <label><strong>Caudal (m³/s)</strong></label>
+                <label><strong>Caudal (L/s)</strong></label>
                 <input type="number" class="form-control caudal" step="0.0001">
             </div>
         </div>
@@ -732,35 +866,31 @@ document.getElementById("btnAgregarRamal").addEventListener("click", () => {
 });
 
 /* ============================
-   ENVÍO A BACKEND
-============================ */
-/* ============================================
-   EVENTO: CALCULAR SISTEMA
-============================================ */
-
-document.getElementById("btnCalcular").addEventListener("click", async () => {
+   CALCULAR SISTEMA (reemplaza envío a backend)
+   ============================ */
+document.getElementById("btnCalcular")?.addEventListener("click", () => {
 
     const cards = document.querySelectorAll("#listaRamales .card");
 
-    if (cards.length === 0) {
+    if (!cards || cards.length === 0) {
         Swal.fire("Sin ramales", "Agrega al menos un ramal antes de calcular.", "warning");
         return;
     }
 
-    let ramales = [];
+    const ramales = [];
 
     for (const card of cards) {
 
-        const longitud   = parseFloat(card.querySelector(".longitud").value);
-        const diametro   = parseFloat(card.querySelector(".diametro").value);
-        const rugosidad  = parseFloat(card.querySelector(".rugosidad").value);
-        const caudal     = parseFloat(card.querySelector(".caudal").value);
+        const longitud   = parseFloat(card.querySelector(".longitud")?.value);
+        const diametro   = parseFloat(card.querySelector(".diametro")?.value);
+        const rugosidad  = parseFloat(card.querySelector(".rugosidad")?.value);
+        const caudal     = parseFloat(card.querySelector(".caudal")?.value);
 
-        const codos      = parseInt(card.querySelector(".codos").value)      || 0;
-        const globo      = parseInt(card.querySelector(".globo").value)      || 0;
-        const compuerta  = parseInt(card.querySelector(".compuerta").value)  || 0;
-        const entradas   = parseInt(card.querySelector(".entradas").value)   || 0;
-        const salidas    = parseInt(card.querySelector(".salidas").value)    || 0;
+        const codos      = parseInt(card.querySelector(".codos")?.value)      || 0;
+        const globo      = parseInt(card.querySelector(".globo")?.value)      || 0;
+        const compuerta  = parseInt(card.querySelector(".compuerta")?.value)  || 0;
+        const entradas   = parseInt(card.querySelector(".entradas")?.value)   || 0;
+        const salidas    = parseInt(card.querySelector(".salidas")?.value)    || 0;
 
         // VALIDACIÓN BÁSICA
         if (!longitud || !diametro || !caudal) {
@@ -770,9 +900,9 @@ document.getElementById("btnCalcular").addEventListener("click", async () => {
 
         ramales.push({
             longitud,
-            diametro,
-            rugosidad: rugosidad / 1000, // a metros
-            caudal,
+            diametro,            // en mm según app.py; se convertirá /1000 dentro de calcularSistemaJS
+            rugosidad: rugosidad / 1000, // rugosidad mm -> m
+            caudal,              // en L/s según app.py; se convertirá /1000 dentro de calcularSistemaJS
             codos,
             globo,
             compuerta,
@@ -781,22 +911,18 @@ document.getElementById("btnCalcular").addEventListener("click", async () => {
         });
     }
 
-    // ENVIAR AL BACKEND PYTHON
-    const respuesta = await fetch("/calcularSistema", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ramales })
-    });
-
-    const datos = await respuesta.json();
-
-    mostrarResultados(datos.resultados);
+    // Llamada local en lugar de fetch al backend
+    try {
+      const resultados = calcularSistemaJS(ramales); // devuelve array de resultados
+      mostrarResultados(resultados);
+    } catch (err) {
+      Swal.fire({icon:'error', title:'Error', text:'Error calculando el sistema localmente.'});
+    }
 });
 
-/* ============================================
-   MOSTRAR RESULTADOS
-============================================ */
-
+/* ============================
+   MOSTRAR RESULTADOS (igual estructura que antes)
+   ============================ */
 function mostrarResultados(lista) {
 
     const div = document.getElementById("resultados");
@@ -823,12 +949,12 @@ function mostrarResultados(lista) {
         html += `
             <tr>
                 <td>${i + 1}</td>
-                <td>${r.velocidad.toFixed(3)}</td>
-                <td>${r.reynolds.toFixed(0)}</td>
-                <td>${r.f.toFixed(5)}</td>
-                <td>${r.h_mayor.toFixed(3)}</td>
-                <td>${r.h_menor.toFixed(3)}</td>
-                <td>${r.h_total.toFixed(3)}</td>
+                <td>${isFinite(r.velocidad) ? r.velocidad.toFixed(3) : '0.000'}</td>
+                <td>${isFinite(r.reynolds) ? r.reynolds.toFixed(0) : '0'}</td>
+                <td>${isFinite(r.f) ? r.f.toFixed(5) : '0.00000'}</td>
+                <td>${isFinite(r.h_mayor) ? r.h_mayor.toFixed(3) : '0.000'}</td>
+                <td>${isFinite(r.h_menor) ? r.h_menor.toFixed(3) : '0.000'}</td>
+                <td>${isFinite(r.h_total) ? r.h_total.toFixed(3) : '0.000'}</td>
             </tr>
         `;
     });
@@ -841,7 +967,7 @@ function mostrarResultados(lista) {
 
     div.innerHTML = html;
 }
-
 </script>
+
 </body>
 </html>
